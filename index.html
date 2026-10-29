@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BLE printer test</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 24px auto; padding: 0 16px; line-height: 1.45; }
+  fieldset { margin: 14px 0; border: 1px solid #888; border-radius: 8px; }
+  legend { padding: 0 6px; font-weight: 600; }
+  button { padding: 8px 14px; margin: 4px 6px 4px 0; font-size: 14px; cursor: pointer; }
+  label { display: inline-block; margin: 4px 12px 4px 0; }
+  input, select { width: 90px; padding: 4px; }
+  pre { background: #111; color: #ddd; padding: 12px; border-radius: 8px; height: 280px; overflow: auto; font-size: 12px; white-space: pre-wrap; }
+  .note { color: #666; font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>TSPL over Bluetooth Low Energy: test page</h1>
+<p class="note">Untested page. Use Chrome or Edge on desktop. Open it from <b>http://localhost</b> (see below), not by double-clicking the file. Close every other app that uses the printer (phone app, nRF Connect), because a BLE printer usually accepts one connection at a time.</p>
+
+<fieldset>
+  <legend>1. Connect</legend>
+  <button id="connect">Connect to printer</button>
+  <button id="disconnect">Disconnect</button>
+</fieldset>
+
+<fieldset>
+  <legend>2. Label and speed settings</legend>
+  <label>Width mm <input id="w" type="number" value="50"></label>
+  <label>Height mm <input id="h" type="number" value="30"></label>
+  <label>Gap mm <input id="g" type="number" value="3"></label><br>
+  <label>Chunk bytes <input id="chunk" type="number" value="20"></label>
+  <label>Delay ms <input id="delay" type="number" value="30"></label>
+  <label>Dot polarity
+    <select id="pol">
+      <option value="black0">black = 0 (TSPL usual)</option>
+      <option value="black1">black = 1 (inverted)</option>
+    </select>
+  </label>
+  <p class="note">Assumes 203 dpi (8 dots per mm). The SDK writes 20 bytes with a 30 ms pause. To test speed, raise the chunk size (for example 100, 180, 240) and lower the delay (for example 10, 0).</p>
+</fieldset>
+
+<fieldset>
+  <legend>3. Print</legend>
+  <button id="printText">Print text label (small)</button>
+  <button id="printBitmap">Print bitmap test pattern</button>
+  <button id="status">Query status (ESC ! ?)</button>
+  <p class="note">The bitmap pattern has a solid black square in the TOP-LEFT corner, a border and a diagonal line. If the label comes out mostly black with a white square, switch the polarity and print again.</p>
+</fieldset>
+
+<pre id="log"></pre>
+
+<script>
+const SERVICE = '49535343-fe7d-4ae5-8fa9-9fafd205e455';
+const WRITE_UUID = '49535343-8841-43f4-a8d4-ecbe34729bb3';
+const NOTIFY_UUID = '49535343-1e4d-4bd9-ba61-23c647249616';
+const $ = id => document.getElementById(id);
+const enc = new TextEncoder();
+let device = null, writeChar = null;
+
+function log(msg) {
+  const el = $('log');
+  el.textContent += new Date().toLocaleTimeString() + '  ' + msg + '\n';
+  el.scrollTop = el.scrollHeight;
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const dots = mm => Math.round(Number(mm) * 8); // about 203 dpi
+const hex = u8 => Array.from(u8).map(b => b.toString(16).padStart(2, '0')).join(' ');
+const PROPS = ['broadcast', 'read', 'writeWithoutResponse', 'write', 'notify', 'indicate', 'authenticatedSignedWrites', 'reliableWrite', 'writableAuxiliaries'];
+
+function concat(...parts) {
+  const total = parts.reduce((n, p) => n + p.length, 0);
+  const out = new Uint8Array(total);
+  let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+}
+
+async function connect() {
+  try {
+    if (!navigator.bluetooth) { log('Web Bluetooth is not available in this browser or page. Use Chrome or Edge on http://localhost or https.'); return; }
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [SERVICE] }, { namePrefix: 'Thermal' }],
+      optionalServices: [SERVICE]
+    });
+    log('Picked: ' + device.name);
+    device.addEventListener('gattserverdisconnected', () => { log('Disconnected'); writeChar = null; });
+    const server = await device.gatt.connect();
+    log('GATT connected');
+    const svc = await server.getPrimaryService(SERVICE);
+    const chars = await svc.getCharacteristics();
+    for (const c of chars) {
+      log('Characteristic ' + c.uuid + ' properties: ' + (PROPS.filter(k => c.properties[k]).join(', ') || 'none'));
+    }
+    writeChar = chars.find(c => c.uuid === WRITE_UUID) ||
+                chars.find(c => c.properties.writeWithoutResponse || c.properties.write);
+    log('Write characteristic: ' + (writeChar ? writeChar.uuid : 'NOT FOUND'));
+    const notifyChar = chars.find(c => c.uuid === NOTIFY_UUID) || chars.find(c => c.properties.notify);
+    if (notifyChar) {
+      await notifyChar.startNotifications();
+      notifyChar.addEventListener('characteristicvaluechanged', e => {
+        const v = e.target.value;
+        log('REPLY: ' + hex(new Uint8Array(v.buffer, v.byteOffset, v.byteLength)));
+      });
+      log('Listening for replies on ' + notifyChar.uuid);
+    } else {
+      log('No notify characteristic found, replies will not be seen.');
+    }
+  } catch (e) {
+    log('ERROR: ' + e.message);
+  }
+}
+
+function disconnect() {
+  if (device && device.gatt.connected) device.gatt.disconnect();
+}
+
+async function send(bytes) {
+  if (!writeChar) { log('Not connected.'); return; }
+  const size = Math.max(1, parseInt($('chunk').value, 10) || 20);
+  const delay = Math.max(0, parseInt($('delay').value, 10) || 0);
+  const noResponse = writeChar.properties.writeWithoutResponse;
+  const t0 = performance.now();
+  try {
+    for (let i = 0; i < bytes.length; i += size) {
+      const part = bytes.slice(i, i + size);
+      if (noResponse) await writeChar.writeValueWithoutResponse(part);
+      else await writeChar.writeValueWithResponse(part);
+      if (delay) await sleep(delay);
+    }
+    log('Sent ' + bytes.length + ' bytes in ' + Math.round(performance.now() - t0) + ' ms (chunk ' + size + ', delay ' + delay + ' ms, ' + (noResponse ? 'write without response' : 'write with response') + ')');
+  } catch (e) {
+    log('SEND ERROR after ' + Math.round(performance.now() - t0) + ' ms: ' + e.message);
+  }
+}
+
+function header() {
+  return 'SIZE ' + $('w').value + ' mm,' + $('h').value + ' mm\r\n' +
+         'GAP ' + $('g').value + ' mm,0 mm\r\n' +
+         'DIRECTION 0\r\n' +
+         'CLS\r\n';
+}
+
+function printText() {
+  const W = dots($('w').value), H = dots($('h').value);
+  const cmd = header() +
+    'BOX 8,8,' + (W - 8) + ',' + (H - 8) + ',4\r\n' +
+    'TEXT 30,40,"3",0,2,2,"HELLO BLE"\r\n' +
+    'PRINT 1\r\n';
+  log('Sending text label:\n' + cmd.replace(/\r\n/g, '\n'));
+  return send(enc.encode(cmd));
+}
+
+function printBitmap() {
+  const W = dots($('w').value), H = dots($('h').value);
+  const bytesPerRow = Math.ceil(W / 8);
+  const blackIsZero = $('pol').value === 'black0';
+  const data = new Uint8Array(bytesPerRow * H);
+  data.fill(blackIsZero ? 0xFF : 0x00); // everything white, including padding bits
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const black = (x < 48 && y < 48) || x < 4 || y < 4 || x >= W - 4 || y >= H - 4 || Math.abs((x * H) / W - y) < 2;
+      if (!black) continue;
+      const idx = y * bytesPerRow + (x >> 3);
+      const mask = 0x80 >> (x & 7);
+      if (blackIsZero) data[idx] &= ~mask; else data[idx] |= mask;
+    }
+  }
+  const head = enc.encode(header() + 'BITMAP 0,0,' + bytesPerRow + ',' + H + ',0,');
+  const tail = enc.encode('\r\nPRINT 1\r\n');
+  const bytes = concat(head, data, tail);
+  log('Sending bitmap ' + W + 'x' + H + ' dots, ' + bytesPerRow + ' bytes per row, polarity ' + $('pol').value + ', total ' + bytes.length + ' bytes');
+  return send(bytes);
+}
+
+function queryStatus() {
+  log('Sending ESC ! ? (27 33 63). Watch for a REPLY line below.');
+  return send(new Uint8Array([27, 33, 63]));
+}
+
+$('connect').addEventListener('click', connect);
+$('disconnect').addEventListener('click', disconnect);
+$('printText').addEventListener('click', printText);
+$('printBitmap').addEventListener('click', printBitmap);
+$('status').addEventListener('click', queryStatus);
+log('Ready. Click "Connect to printer".');
+</script>
+</body>
+</html>
